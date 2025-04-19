@@ -1,5 +1,2 @@
-swarms
+torch
 loguru
-python-dotenv
-pyyaml
-swarm-models

@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
 from typing import Optional
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 def apply_rope(x: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
@@ -44,27 +45,32 @@ def get_rope_matrix(seq_len: int, dim: int, device: torch.device) -> torch.Tenso
 
 class MultiHeadLinearAttention(nn.Module):
     """
-    Multi-head Linear Attention module with support for VO-RoPE (RoPE on Value and Output).
+    Multi-head Linear Attention module with support for VO-RoPE (RoPE on Value and Output),
+    sharding, and multi-GPU parallelism via DistributedDataParallel (DDP).
 
     Args:
         dim (int): Input and output dimension
         heads (int): Number of attention heads
         dropout (float): Dropout probability
+        device (Optional[torch.device]): Device for computation
     """
 
-    def __init__(self, dim: int, heads: int = 8, dropout: float = 0.1):
+    def __init__(self, dim: int, heads: int = 8, dropout: float = 0.1, device: Optional[torch.device] = None):
         super().__init__()
         assert dim % heads == 0, "Dimension must be divisible by number of heads."
 
         self.dim = dim
         self.heads = heads
         self.head_dim = dim // heads
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.to_q = nn.Linear(dim, dim, bias=False)
         self.to_k = nn.Linear(dim, dim, bias=False)
         self.to_v = nn.Linear(dim, dim, bias=False)
         self.to_out = nn.Linear(dim, dim)
         self.dropout = nn.Dropout(dropout)
+
+        self.to(self.device)
 
     def forward(
         self,
@@ -74,7 +80,6 @@ class MultiHeadLinearAttention(nn.Module):
     ) -> torch.Tensor:
         B, T, D = x.shape
         H = self.heads
-        device = x.device
 
         logger.debug(f"Input shape: {x.shape}")
 
@@ -87,7 +92,7 @@ class MultiHeadLinearAttention(nn.Module):
 
         # RoPE
         if use_vo_rope:
-            rope = get_rope_matrix(T, self.head_dim, device)
+            rope = get_rope_matrix(T, self.head_dim, self.device)
             v = apply_rope(v, rope)  # Apply RoPE to V
             logger.debug("Applied RoPE to V")
 
@@ -98,18 +103,29 @@ class MultiHeadLinearAttention(nn.Module):
         out = scores @ v
 
         if use_vo_rope:
-            # Apply inverse RoPE at output
-            inv_rope = get_rope_matrix(T, self.head_dim, device).transpose(0, 1)
+            inv_rope = get_rope_matrix(T, self.head_dim, self.device).transpose(0, 1)
             out = apply_rope(out, inv_rope)
             logger.debug("Applied inverse RoPE to output")
 
         out = out.transpose(1, 2).contiguous().view(B, T, D)
         return self.to_out(self.dropout(out))
 
+    def shard(self):
+        """
+        Wraps the module with DistributedDataParallel if multiple GPUs are available.
+        """
+        if torch.cuda.device_count() > 1:
+            logger.info(f"Using DistributedDataParallel on {torch.cuda.device_count()} GPUs")
+            return DDP(self)
+        else:
+            logger.info("Running on single device")
+            return self
+
 
 if __name__ == "__main__":
-    logger.info("Testing VO-RoPE MultiHeadLinearAttention")
-    model = MultiHeadLinearAttention(dim=64, heads=8).cuda() if torch.cuda.is_available() else MultiHeadLinearAttention(dim=64, heads=8)
-    x = torch.randn(2, 128, 64).to(model.to_q.weight.device)
+    logger.info("Testing VO-RoPE MultiHeadLinearAttention with sharding support")
+    model = MultiHeadLinearAttention(dim=64, heads=8)
+    model = model.shard()
+    x = torch.randn(2, 128, 64).to(next(model.parameters()).device)
     y = model(x)
     logger.success(f"Output shape: {y.shape}")

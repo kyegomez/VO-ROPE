@@ -17,7 +17,7 @@ jobs:
       - run: go install github.com/google/yamlfmt/cmd/yamlfmt@latest
       - run: yamlfmt .
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
       - run: pip install ruff
       - run: ruff format .
       - run: ruff check --fix .
